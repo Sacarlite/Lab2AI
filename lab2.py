@@ -3,12 +3,14 @@ import torch
 import torchaudio
 import yt_dlp
 import os
+import time
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from transformers import Wav2Vec2Processor, Wav2Vec2ForSequenceClassification
 from sklearn.model_selection import train_test_split
 import numpy as np
 import gc
+import shutil
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Используется устройство: {device}")
@@ -21,6 +23,17 @@ def load_data(file_path):
     category_to_idx = {cat: idx for idx, cat in enumerate(categories)}
     df['label'] = df['category'].map(category_to_idx)
     return df, category_to_idx
+
+
+def check_video_availability(url):
+    """Проверка доступности видео перед загрузкой"""
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+            ydl.extract_info(url, download=False)
+        return True
+    except Exception:
+        print(f"Видео по ссылке {url} недоступно для скачивания")
+        return False
 
 
 def download_and_load_audio(url, output_dir="temp_audio", ffmpeg_path="ffmpeg/bin/ffmpeg.exe", max_length=80000):
@@ -44,23 +57,18 @@ def download_and_load_audio(url, output_dir="temp_audio", ffmpeg_path="ffmpeg/bi
         waveform, sample_rate = torchaudio.load(str(audio_file))
 
         if sample_rate != 16000:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sample_rate,
-                new_freq=16000
-            )
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
             waveform = resampler(waveform)
             sample_rate = 16000
 
-        # Если стерео, преобразуем в моно, усредняя каналы
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
-        # Обрезаем или дополняем waveform до фиксированной длины
         if waveform.shape[1] > max_length:
-            waveform = waveform[:, :max_length]  # Обрезка
+            waveform = waveform[:, :max_length]
         elif waveform.shape[1] < max_length:
             padding = torch.zeros(waveform.shape[0], max_length - waveform.shape[1])
-            waveform = torch.cat([waveform, padding], dim=1)  # Дополнение
+            waveform = torch.cat([waveform, padding], dim=1)
 
         os.remove(audio_file)
         return waveform, sample_rate
@@ -71,8 +79,8 @@ def download_and_load_audio(url, output_dir="temp_audio", ffmpeg_path="ffmpeg/bi
 
 class YouTubeAudioDataset(Dataset):
     def __init__(self, links, labels, processor, max_length=80000):
-        self.links = links
-        self.labels = labels
+        self.links = [link for link in links if check_video_availability(link)]
+        self.labels = [labels[i] for i, link in enumerate(links) if check_video_availability(link)]
         self.processor = processor
         self.max_length = max_length
 
@@ -84,45 +92,33 @@ class YouTubeAudioDataset(Dataset):
         label = self.labels[idx]
         waveform, sample_rate = download_and_load_audio(link, max_length=self.max_length)
         if waveform is None:
-            # Возвращаем пустые данные в случае ошибки (обратите внимание на attention_mask)
             return (
                 torch.zeros(1, self.max_length),
-                torch.zeros(1, self.max_length),  # attention_mask из нулей означает, что данные игнорируются
+                torch.zeros(1, self.max_length),
                 torch.tensor(label, dtype=torch.long)
             )
 
-        # Преобразуем waveform в numpy массив и убираем лишние размерности
-        waveform_np = waveform.squeeze().numpy()  # Преобразуем в 1D numpy массив
-
-        # Обрабатываем waveform с помощью processor
+        waveform_np = waveform.squeeze().numpy()
         processed = self.processor(
-            waveform_np,  # Передаем 1D numpy массив
+            waveform_np,
             sampling_rate=sample_rate,
             return_tensors="pt",
-            padding='max_length',  # Исправлено: padding='max_length' для гарантии attention_mask
-            truncation=True,  # Обрезаем, если длиннее max_length
-            max_length=self.max_length  # Устанавливаем max_length для обрезки и дополнения
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length
         )
 
-        # Проверяем, что attention_mask присутствует
-        if 'attention_mask' not in processed:
-            print(f"Предупреждение: attention_mask отсутствует для ссылки {link}. Используем маску из единиц.")
-            attention_mask = torch.ones_like(processed.input_values)  # Заполняем единицами как запасной вариант
-        else:
-            attention_mask = processed.attention_mask
-
+        attention_mask = processed.get('attention_mask', torch.ones_like(processed.input_values))
         return (
-            processed.input_values.squeeze(0),  # Убираем размерность батча
-            attention_mask.squeeze(0),  # Убираем размерность батча
+            processed.input_values.squeeze(0),
+            attention_mask.squeeze(0),
             torch.tensor(label, dtype=torch.long)
         )
 
 
 def collate_fn(batch):
-    # Фильтруем пустые данные
     filtered_batch = [item for item in batch if not torch.all(item[0] == 0)]
     if not filtered_batch:
-        # Если все элементы пустые, возвращаем пустой батч
         return torch.tensor([]), torch.tensor([]), torch.tensor([])
 
     input_values = torch.stack([item[0] for item in filtered_batch])
@@ -134,12 +130,17 @@ def collate_fn(batch):
 
 def train_and_evaluate(train_loader, test_loader, model, num_epochs=3):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    start_time = time.time()
+    total_train_loss = 0
+    total_test_accuracy = 0
 
     for epoch in range(num_epochs):
         model.train()
-        total_loss = 0
+        epoch_loss = 0
+        epoch_start_time = time.time()
+
         for batch_idx, (input_values, attention_mask, labels) in enumerate(train_loader):
-            if input_values.numel() == 0:  # Пропускаем пустые батчи
+            if input_values.numel() == 0:
                 continue
             input_values = input_values.to(device)
             attention_mask = attention_mask.to(device)
@@ -150,40 +151,54 @@ def train_and_evaluate(train_loader, test_loader, model, num_epochs=3):
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            total_loss += loss.item()
+            epoch_loss += loss.item()
 
-            # Очищаем память
             del input_values, attention_mask, labels, outputs, loss
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        avg_loss = total_loss / len(train_loader)
-        print(f"Эпоха {epoch + 1}/{num_epochs}, Loss: {avg_loss:.4f}")
+        avg_epoch_loss = epoch_loss / len(train_loader)
+        total_train_loss += avg_epoch_loss
 
-    model.eval()
-    all_preds = []
-    all_labels = []
-    with torch.no_grad():
-        for input_values, attention_mask, labels in test_loader:
-            if input_values.numel() == 0:  # Пропускаем пустые батчи
-                continue
-            input_values = input_values.to(device)
-            attention_mask = attention_mask.to(device)
-            labels = labels.to(device)
-            outputs = model(input_values, attention_mask=attention_mask)
-            preds = torch.argmax(outputs.logits, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+        model.eval()
+        epoch_preds = []
+        epoch_labels = []
+        with torch.no_grad():
+            for input_values, attention_mask, labels in test_loader:
+                if input_values.numel() == 0:
+                    continue
+                input_values = input_values.to(device)
+                attention_mask = attention_mask.to(device)
+                labels = labels.to(device)
+                outputs = model(input_values, attention_mask=attention_mask)
+                preds = torch.argmax(outputs.logits, dim=1)
+                epoch_preds.extend(preds.cpu().numpy())
+                epoch_labels.extend(labels.cpu().numpy())
 
-            # Очищаем память
-            del input_values, attention_mask, labels, outputs, preds
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                del input_values, attention_mask, labels, outputs, preds
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-    accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
-    print(f"\nAccuracy: {accuracy:.4f}")
+        epoch_accuracy = np.mean(np.array(epoch_preds) == np.array(epoch_labels)) * 100
+        total_test_accuracy += epoch_accuracy
+
+        print(
+            f"Эпоха {epoch + 1}, Время обучения: {round(time.time() - epoch_start_time, 2)}с., "
+            f"Потери: {avg_epoch_loss:.4f}, Точность: {epoch_accuracy:.2f}%"
+        )
+
+    avg_train_loss = total_train_loss / num_epochs
+    avg_test_accuracy = total_test_accuracy / num_epochs
+    total_time = round(time.time() - start_time, 2)
+
+    print("\nОбщая статистика:")
+    print(
+        f"Всего эпох: {num_epochs}, Общее время обучения: {total_time}с., "
+        f"Средние потери: {avg_train_loss:.4f}, Средняя точность: {avg_test_accuracy:.2f}%"
+    )
+
     return model
 
 
@@ -198,13 +213,12 @@ def main():
             if train_size <= 0 or test_size <= 0:
                 print("Число должно быть положительным")
             elif train_size + test_size > len(data):
-                print(f"Превышено доступное количество записей, сумма данных для теста и тренировки не должна превосходить колличество ({len(data)})")
+                print(f"Превышено доступное количество записей ({len(data)})")
             else:
                 break
         except ValueError:
             print("Введите целое число")
 
-    # Выбираем случайные данные
     sampled_data = data.sample(n=train_size + test_size)
     train_data, test_data = train_test_split(sampled_data, test_size=test_size)
     train_links = train_data['link'].tolist()
@@ -218,24 +232,18 @@ def main():
         num_labels=len(category_map)
     ).to(device)
 
-    # Устанавливаем max_length (5 секунд при 16 кГц)
     max_length = 80000
     train_dataset = YouTubeAudioDataset(train_links, train_labels, processor, max_length=max_length)
     test_dataset = YouTubeAudioDataset(test_links, test_labels, processor, max_length=max_length)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=1,  # Начинаем с 1 для отладки
-        shuffle=True,
-        collate_fn=collate_fn
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=1,  # Начинаем с 1 для отладки
-        collate_fn=collate_fn
-    )
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=collate_fn)
 
     trained_model = train_and_evaluate(train_loader, test_loader, model)
+
+    # Очистка временной папки
+    if os.path.exists("temp_audio"):
+        shutil.rmtree("temp_audio")
 
     del trained_model, train_dataset, test_dataset, train_loader, test_loader
     gc.collect()
